@@ -5,6 +5,9 @@ on:
     branches:
       - main
       - develop
+  # Redeploy manual sin commit: `gh workflow run deploy.yml --ref develop`.
+  # La rama elegida decide el entorno igual que en un push (main → prod).
+  workflow_dispatch:
 
 # Un solo deploy por rama a la vez, y gana el commit mas nuevo.
 #
