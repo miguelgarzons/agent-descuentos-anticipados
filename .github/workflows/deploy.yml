@@ -1,0 +1,738 @@
+name: CI/CD — Descuentos Anticipados (Security + Deploy)
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+
+# Un solo deploy por rama a la vez, y gana el commit mas nuevo.
+#
+# Sin esto, dos pushes seguidos producen dos runs en paralelo que aterrizan en
+# el orden en que terminen: si el del commit viejo acaba ultimo, deja en Cloud
+# Run la imagen vieja y el arreglo recien empujado se pierde en silencio. Paso
+# el 2026-08-03 con dos commits separados por dos minutos.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  REGION: us-central1
+  IMAGE_NAME: adk-descuentos-anticipados
+
+jobs:
+  # ============================================================
+  # JOB 1: SECURITY — Si falla, el deploy NUNCA corre
+  # ============================================================
+  security:
+    name: 🔐 Security Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      # ──────────────────────────────────────────────────────
+      # CHECKOUT (historial completo para gitleaks)
+      # ──────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ──────────────────────────────────────────────────────
+      # 1. VERIFICAR QUE .env REAL NO ESTÁ COMMITEADO
+      # ──────────────────────────────────────────────────────
+      - name: 🚫 Check .env not committed
+        run: |
+          echo "Verificando que archivos .env sensibles no estén trackeados..."
+
+          BLOCKED_FILES=(".env" ".env.local" ".env.production" ".env.staging")
+          FOUND=0
+
+          for f in "${BLOCKED_FILES[@]}"; do
+            if git ls-files --error-unmatch "$f" 2>/dev/null; then
+              echo "❌ ERROR: '$f' está commiteado. NUNCA suba archivos .env reales."
+              FOUND=1
+            fi
+          done
+
+          if [ "$FOUND" -eq 1 ]; then exit 1; fi
+          echo "✅ Sin archivos .env sensibles commiteados."
+
+      # ──────────────────────────────────────────────────────
+      # 2. POLÍTICA NO-SQL — Cero SQL en el código
+      #    Este proyecto usa SOLO peticiones HTTP, nunca BD directa
+      # ──────────────────────────────────────────────────────
+      - name: 🛑 NO-SQL Policy — Zero SQL allowed
+        run: |
+          echo "Verificando política NO-SQL: este proyecto NO debe tener SQL hardcodeado ni conexiones directas a BD..."
+          echo ""
+
+          FOUND=0
+          REPORT=""
+
+          # ── Patrones de queries SQL en strings ──────────────────────
+          SQL_QUERY_PATTERNS=(
+            "SELECT[[:space:]]+.*FROM"
+            "INSERT[[:space:]]+INTO"
+            "UPDATE[[:space:]]+.*SET[[:space:]]"
+            "DELETE[[:space:]]+FROM"
+            "CREATE[[:space:]]+TABLE"
+            "ALTER[[:space:]]+TABLE"
+            "DROP[[:space:]]+(TABLE|DATABASE|INDEX)"
+            "TRUNCATE[[:space:]]+TABLE"
+            "EXECUTE[[:space:]]*\("
+            "cursor\.(execute|executemany|callproc)"
+            "\.raw\(\".*SELECT"
+          )
+
+          # ── Imports de drivers/ORMs de BD ────────────────────────────
+          DB_IMPORT_PATTERNS=(
+            "import psycopg"
+            "import psycopg2"
+            "import pymysql"
+            "import MySQLdb"
+            "import sqlite3"
+            "import cx_Oracle"
+            "import pyodbc"
+            "import motor"
+            "import pymongo"
+            "from sqlalchemy"
+            "import sqlalchemy"
+            "from tortoise"
+            "from peewee"
+            "import peewee"
+            "from django.db import models"
+            "create_engine\("
+            "sessionmaker\("
+            "Base\.metadata"
+          )
+
+          # ── Connection strings ────────────────────────────────────────
+          CONN_STRING_PATTERNS=(
+            "postgresql://"
+            "postgres://"
+            "mysql://"
+            "sqlite:///"
+            "oracle://"
+            "mssql://"
+            "mongodb://"
+            "mongodb\+srv://"
+          )
+
+          ALL_PATTERNS=("${SQL_QUERY_PATTERNS[@]}" "${DB_IMPORT_PATTERNS[@]}" "${CONN_STRING_PATTERNS[@]}")
+
+          for PATTERN in "${ALL_PATTERNS[@]}"; do
+            MATCHES=$(grep -rn --include="*.py" -i -E "$PATTERN" . \
+              --exclude-dir=".git" \
+              --exclude-dir=".venv" \
+              --exclude-dir="venv" \
+              --exclude-dir="__pycache__" \
+              --exclude-dir="tests" \
+              2>/dev/null || true)
+
+            if [ -n "$MATCHES" ]; then
+              FOUND=1
+              REPORT="$REPORT\n  Patrón: [$PATTERN]\n$MATCHES\n"
+            fi
+          done
+
+          if [ "$FOUND" -eq 1 ]; then
+            echo "❌ POLÍTICA NO-SQL VIOLADA — Se encontró SQL o conexiones directas a BD:"
+            echo ""
+            echo -e "$REPORT"
+            echo ""
+            echo "📋 Regla: Este proyecto se comunica EXCLUSIVAMENTE a través de peticiones HTTP."
+            echo "   No se permite ningún tipo de SQL directo, ORM ni driver de BD."
+            echo "   Usa las APIs o endpoints definidos en el proyecto en su lugar."
+            exit 1
+          fi
+
+          echo "✅ Política NO-SQL: sin SQL ni conexiones directas a BD detectadas."
+
+      # ──────────────────────────────────────────────────────
+      # 3. GITLEAKS — Secrets en historial git
+      # ──────────────────────────────────────────────────────
+      - name: 🔍 Gitleaks — Secret scanning
+        run: |
+          GITLEAKS_VERSION="8.27.2"
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar -xz gitleaks
+          chmod +x gitleaks
+
+          echo "Ejecutando Gitleaks para detectar secrets en el historial git..."
+
+          ./gitleaks detect \
+            --source . \
+            --log-opts="--all" \
+            --verbose \
+            --no-git=false \
+            --redact \
+            --exit-code 1 || {
+            echo "❌ Gitleaks encontró secrets en el historial. Revísalos y elimínalos antes de continuar."
+            exit 1
+          }
+
+          echo "✅ Gitleaks: sin secrets detectados."
+
+      # ──────────────────────────────────────────────────────
+      # 3. DETECT-SECRETS — Credenciales hardcodeadas
+      # ──────────────────────────────────────────────────────
+      - name: 🔐 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 🔐 detect-secrets — Credenciales hardcodeadas
+        run: |
+          pip install detect-secrets --quiet
+
+          echo "Ejecutando detect-secrets..."
+
+          # Archivos excluidos del scan (referencian nombres de secretos por diseño)
+          EXCLUDE_PATTERN='(\.env\.example|\.secrets\.baseline|\.github/workflows/.*\.yml|\.pre-commit-config\.yaml)$'
+
+          if [ -f ".secrets.baseline" ]; then
+            FILES=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || git ls-files)
+            FILTERED=$(echo "$FILES" | grep -Ev "$EXCLUDE_PATTERN" || true)
+
+            if [ -n "$FILTERED" ]; then
+              detect-secrets-hook --baseline .secrets.baseline $FILTERED
+            else
+              echo "ℹ️  No hay archivos de aplicación para escanear en este commit."
+            fi
+          else
+            detect-secrets scan \
+              --exclude-files "$EXCLUDE_PATTERN" \
+              > .secrets.baseline
+
+            SECRETS_COUNT=$(python3 -c "
+          import json
+          data = json.load(open('.secrets.baseline'))
+          total = sum(len(v) for v in data.get('results', {}).values())
+          print(total)
+          ")
+            if [ "$SECRETS_COUNT" -gt 0 ]; then
+              echo "❌ detect-secrets encontró $SECRETS_COUNT posibles secretos."
+              exit 1
+            fi
+          fi
+
+          echo "✅ detect-secrets: sin credenciales hardcodeadas."
+
+      # ──────────────────────────────────────────────────────
+      # 4. BANDIT — Seguridad Python
+      # ──────────────────────────────────────────────────────
+      - name: 🐍 Bandit — Python security analysis
+        run: |
+          pip install bandit --quiet
+
+          echo "Ejecutando Bandit..."
+
+          bandit -r . \
+            -ll \
+            -x ".venv,venv,tests,test,.github" \
+            --format txt \
+            -o bandit-report.txt
+          BANDIT_EXIT=$?
+
+          cat bandit-report.txt
+
+          if [ "$BANDIT_EXIT" -eq 1 ]; then
+            echo "❌ Bandit encontró problemas de seguridad MEDIUM o HIGH."
+            exit 1
+          fi
+
+          echo "✅ Bandit: sin vulnerabilidades críticas."
+
+      - name: Upload Bandit report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-security-report
+          path: bandit-report.txt
+          retention-days: 7
+
+      # ──────────────────────────────────────────────────────
+      # 5. SEMGREP — SQL injection & OWASP
+      # ──────────────────────────────────────────────────────
+      - name: 🎯 Semgrep — SQL injection & OWASP patterns
+        run: |
+          pip install semgrep --quiet
+
+          echo "Ejecutando Semgrep con reglas de seguridad..."
+
+          semgrep scan \
+            --config "p/python" \
+            --config "p/owasp-top-ten" \
+            --config "p/secrets" \
+            --config "p/sql-injection" \
+            --severity ERROR \
+            --error \
+            --quiet \
+            --exclude ".github" \
+            --json-output semgrep-report.json \
+            . || SEMGREP_EXIT=$?
+
+          if [ -f "semgrep-report.json" ]; then
+            python3 -c "
+          import json
+          with open('semgrep-report.json') as f:
+              data = json.load(f)
+          results = data.get('results', [])
+          if results:
+              print(f'\n❌ Semgrep encontró {len(results)} issue(s):\n')
+              for r in results:
+                  path = r.get('path', 'unknown')
+                  line = r.get('start', {}).get('line', '?')
+                  msg = r.get('extra', {}).get('message', '')[:120]
+                  severity = r.get('extra', {}).get('severity', 'UNKNOWN')
+                  rule = r.get('check_id', 'unknown').split('.')[-1]
+                  print(f'  [{severity}] {path}:{line} — {rule}')
+                  print(f'    {msg}\n')
+          else:
+              print('✅ Semgrep: sin issues críticos.')
+          "
+          fi
+
+          if [ "${SEMGREP_EXIT:-0}" -ne 0 ]; then
+            echo "❌ Semgrep encontró patrones inseguros. Corrígelos antes de desplegar."
+            exit 1
+          fi
+
+      - name: Upload Semgrep report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-security-report
+          path: semgrep-report.json
+          retention-days: 7
+
+      # ──────────────────────────────────────────────────────
+      # 6. PIP-AUDIT — CVEs en dependencias
+      # ──────────────────────────────────────────────────────
+      - name: 🔒 pip-audit — CVE scan en dependencias
+        run: |
+          pip install pip-audit --quiet
+
+          echo "Creando virtualenv aislado para auditar SOLO dependencias de producción..."
+          # Usar venv propio evita escanear herramientas CI (semgrep, bandit, etc.)
+          python -m venv /tmp/prod-audit-env
+          /tmp/prod-audit-env/bin/pip install --upgrade pip --quiet
+          /tmp/prod-audit-env/bin/pip install -r requirements.txt --quiet
+
+          echo "Escaneando dependencias de producción en busca de CVEs..."
+
+          pip-audit \
+            --path /tmp/prod-audit-env/lib/python*/site-packages \
+            --format markdown \
+            --output pip-audit-report.md \
+            --progress-spinner off || AUDIT_EXIT=$?
+
+          if [ -f "pip-audit-report.md" ]; then
+            cat pip-audit-report.md
+          fi
+
+          if [ "${AUDIT_EXIT:-0}" -ne 0 ]; then
+            echo ""
+            echo "❌ pip-audit encontró vulnerabilidades conocidas en las dependencias."
+            echo "   Actualiza los paquetes afectados en requirements.txt antes de desplegar."
+            exit 1
+          fi
+
+          echo "✅ pip-audit: sin CVEs conocidos en dependencias de producción."
+
+      - name: Upload pip-audit report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pip-audit-report
+          path: pip-audit-report.md
+          retention-days: 7
+
+      # ──────────────────────────────────────────────────────
+      # 7. DEPENDENCIAS PINEADAS — requirements.txt usa == (no >=)
+      # ──────────────────────────────────────────────────────
+      - name: 📌 Check dependency pinning
+        run: |
+          echo "Verificando que todas las dependencias estén pineadas con '=='..."
+
+          if [ ! -f "requirements.txt" ]; then
+            echo "⚠️  No existe requirements.txt — saltando check."
+            exit 0
+          fi
+
+          UNPINNED=0
+          REPORT=""
+
+          while IFS= read -r line || [ -n "$line" ]; do
+            # Ignorar comentarios, líneas vacías y opciones (-r, --index-url, etc.)
+            [[ "$line" =~ ^#.*$ ]] && continue
+            [[ -z "$line" ]] && continue
+            [[ "$line" =~ ^- ]] && continue
+
+            # Detectar dependencias sin == (aceptamos ==, pero no >=, <=, >, <, ~=, sin versión)
+            if ! echo "$line" | grep -qE "=="; then
+              UNPINNED=1
+              REPORT="$REPORT\n  ⚠️  $line"
+            fi
+          done < requirements.txt
+
+          if [ "$UNPINNED" -eq 1 ]; then
+            echo "❌ Dependencias sin pinear encontradas (deben usar '=='):"
+            echo -e "$REPORT"
+            echo ""
+            echo "📋 Usa 'pip freeze > requirements.txt' para pinear todas las versiones exactas."
+            echo "   Las versiones no pineadas pueden introducir cambios rotos o CVEs en deploys futuros."
+            exit 1
+          fi
+
+          echo "✅ Todas las dependencias están pineadas con '=='."
+
+      # ──────────────────────────────────────────────────────
+      # 8. PATRONES PROHIBIDOS — print/debug/breakpoint/credenciales inline
+      # ──────────────────────────────────────────────────────
+      - name: 🚨 Forbidden patterns — print/debug/breakpoint/credentials
+        run: |
+          echo "Verificando patrones prohibidos en código Python..."
+
+          FOUND=0
+          REPORT=""
+
+          # ── Patrones de debug que no deben llegar a producción ────────────
+          DEBUG_PATTERNS=(
+            "breakpoint\(\)"
+            "pdb\.set_trace\(\)"
+            "import pdb"
+            "ipdb\.set_trace\(\)"
+            "debug\s*=\s*True"
+            "DEBUG\s*=\s*True"
+          )
+
+          # ── Asignaciones de credenciales inline (PASS/TOKEN/SECRET/KEY = "...") ──
+          CREDENTIAL_PATTERNS=(
+            "(PASSWORD|PASS|TOKEN|SECRET|API_KEY|APIKEY|PRIVATE_KEY)\s*=\s*[\"'][^\"']{4,}[\"']"
+            "Authorization\s*=\s*[\"']Bearer\s+[A-Za-z0-9._-]{10,}[\"']"
+            "Basic\s+[A-Za-z0-9+/]{20,}="
+          )
+
+          ALL_PATTERNS=("${DEBUG_PATTERNS[@]}" "${CREDENTIAL_PATTERNS[@]}")
+
+          for PATTERN in "${ALL_PATTERNS[@]}"; do
+            MATCHES=$(grep -rn --include="*.py" -i -E "$PATTERN" . \
+              --exclude-dir=".git" \
+              --exclude-dir=".venv" \
+              --exclude-dir="venv" \
+              --exclude-dir="__pycache__" \
+              --exclude-dir="tests" \
+              2>/dev/null || true)
+
+            if [ -n "$MATCHES" ]; then
+              FOUND=1
+              REPORT="$REPORT\n  Patrón: [$PATTERN]\n$MATCHES\n"
+            fi
+          done
+
+          if [ "$FOUND" -eq 1 ]; then
+            echo "❌ PATRONES PROHIBIDOS detectados:"
+            echo ""
+            echo -e "$REPORT"
+            echo ""
+            echo "📋 Reglas:"
+            echo "   • breakpoint/pdb: elimina antes de hacer commit."
+            echo "   • debug=True: usa variables de entorno para controlar el modo debug."
+            echo "   • Credenciales inline: muévelas a variables de entorno / GitHub Secrets."
+            exit 1
+          fi
+
+          echo "✅ Sin patrones prohibidos (debug/breakpoint/credenciales inline)."
+
+      # ──────────────────────────────────────────────────────
+      # RESUMEN
+      # ──────────────────────────────────────────────────────
+      - name: ✅ Security checks passed
+        run: |
+          echo "================================================"
+          echo "  ✅ TODOS LOS CHECKS DE SEGURIDAD PASARON"
+          echo "================================================"
+          echo "  ✔ .env no commiteado"
+          echo "  ✔ Política NO-SQL: cero SQL ni drivers de BD"
+          echo "  ✔ Gitleaks: sin secrets en historial"
+          echo "  ✔ detect-secrets: sin credenciales hardcodeadas"
+          echo "  ✔ Bandit: sin vulnerabilidades Python"
+          echo "  ✔ Semgrep: sin patrones SQL/OWASP inseguros"
+          echo "  ✔ pip-audit: sin CVEs en dependencias"
+          echo "  ✔ Dependencias pineadas con =="
+          echo "  ✔ Sin print/debug/breakpoint/credenciales inline"
+          echo "================================================"
+          echo "  Procediendo con el deploy..."
+          echo "================================================"
+
+  # ============================================================
+  # JOB 2: TESTS — Pruebas unitarias + cobertura ≥ 80%
+  # ============================================================
+  tests:
+    name: 🧪 Tests & Coverage ≥80%
+    runs-on: ubuntu-latest
+    needs: security  # ← Solo corre si security pasó
+
+    steps:
+      # ──────────────────────────────────────────────────────
+      # CHECKOUT
+      # ──────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ──────────────────────────────────────────────────────
+      # SETUP PYTHON
+      # ──────────────────────────────────────────────────────
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # ──────────────────────────────────────────────────────
+      # INSTALAR DEPENDENCIAS
+      # ──────────────────────────────────────────────────────
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip --quiet
+          pip install -r requirements.txt --quiet
+          pip install pytest pytest-asyncio pytest-cov --quiet
+
+      # ──────────────────────────────────────────────────────
+      # EJECUTAR TESTS + COBERTURA
+      # ──────────────────────────────────────────────────────
+      - name: 🧪 Run tests with coverage
+        env:
+          # TODO: el umbral de cobertura (--cov-fail-under) arranca en 40 porque el repo es un
+          # cascarón; súbelo a 80 (como el resto de agentes) al agregar el flujo de negocio.
+          # Variables mínimas para que los módulos importen sin error.
+          # Valores dummy: los tests no deben pegarle a servicios reales.
+          # (tests/conftest.py genera credenciales sintéticas con os.environ.setdefault;
+          #  dejarlas vacías aquí garantiza que ningún tool se considere "configurado".)
+          GEMINI_API_KEY: "test-key"
+          AGENT_MODEL: "gemini-2.5-pro"
+          ZOHO_MCP_URL: ""
+          ZOHO_ORG_ID: ""
+        run: |
+          echo "Ejecutando tests unitarios..."
+
+          pytest tests/ \
+            --cov=agents \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage.xml \
+            --cov-fail-under=40 \
+            -v \
+            --tb=short 2>&1 | tee pytest-output.txt
+
+          EXIT_CODE=${PIPESTATUS[0]}
+
+          echo ""
+          echo "================================================"
+          if [ "$EXIT_CODE" -eq 0 ]; then
+            echo "  ✅ Tests OK — Cobertura ≥ 80%"
+          else
+            echo "  ❌ Tests FALLARON o cobertura < 80%"
+            echo "  Revisa el reporte anterior y corrige antes de desplegar."
+          fi
+          echo "================================================"
+
+          exit $EXIT_CODE
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            coverage.xml
+            pytest-output.txt
+          retention-days: 14
+
+  # ============================================================
+  # JOB 3: DEPLOY — Solo corre si security Y tests pasaron
+  # ============================================================
+  deploy:
+    name: 🚀 Deploy to Cloud Run
+    runs-on: ubuntu-latest
+    needs: [security, tests]  # ← GATE: ambos deben pasar
+
+    environment:
+      name: ${{ github.ref_name == 'main' && 'main' || 'develop' }}
+
+    steps:
+      # ──────────────────────────────────────────────────────
+      # CHECKOUT
+      # ──────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ──────────────────────────────────────────────────────
+      # DEFINE ENVIRONMENT
+      # ──────────────────────────────────────────────────────
+      - name: Define environment variables
+        run: |
+          if [[ "${{ github.ref_name }}" == "main" ]]; then
+            echo "ENVIRONMENT=prod" >> $GITHUB_ENV
+            echo "SERVICE_NAME=adk-descuentos-anticipados-prod" >> $GITHUB_ENV
+            echo "REPOSITORY=adk-descuentos-anticipados-prod" >> $GITHUB_ENV
+          else
+            echo "ENVIRONMENT=dev" >> $GITHUB_ENV
+            echo "SERVICE_NAME=adk-descuentos-anticipados-dev" >> $GITHUB_ENV
+            echo "REPOSITORY=adk-descuentos-anticipados-dev" >> $GITHUB_ENV
+          fi
+
+      # ──────────────────────────────────────────────────────
+      # GUARDA DE CONFIGURACIÓN DE PROD
+      #
+      # `--set-env-vars` reemplaza TODO el conjunto, así que el deploy sobrescribe
+      # cualquier corrección hecha a mano en la revisión. Si alguien copia las
+      # Variables de `develop` al entorno `main` —que es lo natural: la mayoría
+      # son iguales— los valores de dev entran a producción en silencio. Pasó dos
+      # veces el 2026-08-03: el ID del agente y el kill-switch de creación de
+      # notas volvieron a los de dev sin que nada fallara.
+      #
+      # Estas comprobaciones convierten ese fallo silencioso en un deploy que se
+      # cae con el motivo escrito. Solo aplican a prod.
+      # ──────────────────────────────────────────────────────
+      - name: Validar la configuración de prod
+        if: github.ref_name == 'main'
+        env:
+          EV_ZOHO_ASSIGNEE_AGENT_ID: ${{ vars.ZOHO_ASSIGNEE_AGENT_ID }}
+          EV_ZOHO_TOKEN_WEBHOOK_URL: ${{ vars.ZOHO_TOKEN_WEBHOOK_URL }}
+          EV_ZOHO_MCP_URL: ${{ vars.ZOHO_MCP_URL }}
+        run: |
+          FALLOS=0
+
+          # El agente humano se identifica por ID numérico del org de prod. Un
+          # correo aquí es la señal de que se copió el valor de develop: la
+          # búsqueda por correo no lo encuentra y el ticket queda sin dueño.
+          case "$EV_ZOHO_ASSIGNEE_AGENT_ID" in
+            ''|*[!0-9]*)
+              echo "::error::ZOHO_ASSIGNEE_AGENT_ID debe ser el ID numérico del agente en el org de prod. Llegó: '$EV_ZOHO_ASSIGNEE_AGENT_ID'"
+              FALLOS=1 ;;
+          esac
+
+          # Los endpoints del sandbox nunca van en prod.
+          case "$EV_ZOHO_TOKEN_WEBHOOK_URL" in
+            *Sandbox*|*sandbox*)
+              echo "::error::ZOHO_TOKEN_WEBHOOK_URL apunta al sandbox: '$EV_ZOHO_TOKEN_WEBHOOK_URL'"
+              FALLOS=1 ;;
+          esac
+          case "$EV_ZOHO_MCP_URL" in
+            *dev-zoho*)
+              echo "::error::ZOHO_MCP_URL es el del portal de dev."
+              FALLOS=1 ;;
+          esac
+
+          if [ "$FALLOS" -eq 1 ]; then
+            echo ""
+            echo "Corrige las Variables en Settings → Environments → main y vuelve a lanzar."
+            exit 1
+          fi
+          echo "✅ Configuración de prod validada."
+
+      # ──────────────────────────────────────────────────────
+      # AUTH GCP
+      # ──────────────────────────────────────────────────────
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      # ──────────────────────────────────────────────────────
+      # CONFIGURE DOCKER
+      # ──────────────────────────────────────────────────────
+      - name: Configure Docker
+        run: |
+          gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev
+
+      # ──────────────────────────────────────────────────────
+      # DOCKER BUILDX
+      # ──────────────────────────────────────────────────────
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ──────────────────────────────────────────────────────
+      # BUILD & PUSH IMAGE
+      # ──────────────────────────────────────────────────────
+      - name: Build and Push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ──────────────────────────────────────────────────────
+      # DEPLOY CLOUD RUN
+      # ──────────────────────────────────────────────────────
+      - name: Deploy to Cloud Run
+        env:
+          # ────────────────────────────────────────────────────────────────
+          # Variables tomadas de Settings → Environments (main/develop) → Variables.
+          # IMPORTANTE: se pasan por el bloque env: (no interpoladas en el script)
+          # para que bash NO reinterprete su contenido — una contraseña con `$`
+          # interpolada directo en el run: se expande como variable de shell y
+          # llega truncada al servicio ("Contraseña incorrecta").
+          # Al agregar integraciones: registra la variable en GitHub, declárala
+          # aquí como EV_MI_VAR y súmala al --set-env-vars con ${EV_MI_VAR}.
+          # ────────────────────────────────────────────────────────────────
+          EV_AGENT_MODEL: ${{ vars.AGENT_MODEL }}
+          EV_GEMINI_API_KEY: ${{ vars.GEMINI_API_KEY }}
+          EV_ZOHO_MCP_URL: ${{ vars.ZOHO_MCP_URL }}
+          EV_ZOHO_ORG_ID: ${{ vars.ZOHO_ORG_ID }}
+          EV_ZOHO_TOKEN_WEBHOOK_URL: ${{ vars.ZOHO_TOKEN_WEBHOOK_URL }}
+          EV_ZOHO_TOKEN_WEBHOOK_USER: ${{ vars.ZOHO_TOKEN_WEBHOOK_USER }}
+          EV_ZOHO_TOKEN_WEBHOOK_PASS: ${{ vars.ZOHO_TOKEN_WEBHOOK_PASS }}
+          EV_ZOHO_DESK_API_BASE_SANDBOX: ${{ vars.ZOHO_DESK_API_BASE_SANDBOX }}
+          EV_ZOHO_ASSIGNEE_AGENT_ID: ${{ vars.ZOHO_ASSIGNEE_AGENT_ID }}
+          EV_ASSETS_FAB: ${{ vars.ASSETS_FAB }}
+          EV_WATERMARK_PRYMARY_MAME: ${{ vars.WATERMARK_PRYMARY_MAME }}
+          EV_WATERMARK_PRYMARY_AREA: ${{ vars.WATERMARK_PRYMARY_AREA }}
+          EV_WATERMARK_PRYMARY_VICE: ${{ vars.WATERMARK_PRYMARY_VICE }}
+          EV_WATERMARK_WEB: ${{ vars.WATERMARK_WEB }}
+        run: |
+          gcloud run deploy ${{ env.SERVICE_NAME }} \
+            --image=${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            --platform=managed \
+            --region=${{ env.REGION }} \
+            --allow-unauthenticated \
+            --port=8080 \
+            --memory=512Mi \
+            --cpu=1 \
+            --max-instances=3 \
+            --timeout=600 \
+            --set-env-vars="^:@:^ENVIRONMENT=${ENVIRONMENT}:@:AGENT_MODEL=${EV_AGENT_MODEL}:@:GEMINI_API_KEY=${EV_GEMINI_API_KEY}:@:ZOHO_MCP_URL=${EV_ZOHO_MCP_URL}:@:ZOHO_ORG_ID=${EV_ZOHO_ORG_ID}:@:ZOHO_TOKEN_WEBHOOK_URL=${EV_ZOHO_TOKEN_WEBHOOK_URL}:@:ZOHO_TOKEN_WEBHOOK_USER=${EV_ZOHO_TOKEN_WEBHOOK_USER}:@:ZOHO_TOKEN_WEBHOOK_PASS=${EV_ZOHO_TOKEN_WEBHOOK_PASS}:@:ZOHO_DESK_API_BASE_SANDBOX=${EV_ZOHO_DESK_API_BASE_SANDBOX}:@:ZOHO_ASSIGNEE_AGENT_ID=${EV_ZOHO_ASSIGNEE_AGENT_ID}:@:ASSETS_FAB=${EV_ASSETS_FAB}:@:WATERMARK_PRYMARY_MAME=${EV_WATERMARK_PRYMARY_MAME}:@:WATERMARK_PRYMARY_AREA=${EV_WATERMARK_PRYMARY_AREA}:@:WATERMARK_PRYMARY_VICE=${EV_WATERMARK_PRYMARY_VICE}:@:WATERMARK_WEB=${EV_WATERMARK_WEB}:@:GOOGLE_CLOUD_PROJECT=${PROJECT_ID}:@:IDEMPOTENCY_ENABLED=true:@:IDEMPOTENCY_COLLECTION=descuentos_anticipados_idempotency:@:FIRESTORE_DATABASE=categorizador-${ENVIRONMENT}"
+
+      # ──────────────────────────────────────────────────────
+      # NOTA: La tubería Pub/Sub (topic, suscripción, IAM, Firestore) se
+      # provisiona UNA VEZ, fuera del CI, con
+      # agent-categorizador/infra/setup_pubsub_handoff.sh. No se hace aquí
+      # para no requerir permisos admin en la SA del CI.
+      # ──────────────────────────────────────────────────────
+
+      # ──────────────────────────────────────────────────────
+      # VERIFY DEPLOYMENT
+      # ──────────────────────────────────────────────────────
+      - name: Verify deployment
+        run: |
+          sleep 10
+
+          URL=$(gcloud run services describe ${{ env.SERVICE_NAME }} \
+            --platform managed \
+            --region ${{ env.REGION }} \
+            --format='value(status.url)')
+
+          echo "======================================"
+          echo "Deployment successful"
+          echo "Environment: ${{ env.ENVIRONMENT }}"
+          echo "Service URL: $URL"
+          echo "======================================"

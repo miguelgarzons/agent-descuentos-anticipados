@@ -1,0 +1,59 @@
+# ══════════════════════════════════════════════════════════════
+# Descuentos Anticipados — CUN ADK Agent — Docker Compose
+# ══════════════════════════════════════════════════════════════
+#
+# Servicios:
+#   descuentos-anticipados-dev   → Interfaz web de desarrollo (adk web)
+#   descuentos-anticipados-api   → API REST para integraciones (adk api_server)
+#
+# Uso:
+#   # Interfaz web de desarrollo:
+#   docker-compose up --build descuentos-anticipados-dev
+#
+#   # API REST (equivalente al runtime de Cloud Run):
+#   docker-compose up --build descuentos-anticipados-api
+#
+# Requiere un .env en la raíz (copiar de .env.example).
+#
+# ══════════════════════════════════════════════════════════════
+
+services:
+
+  # ── Interfaz web de desarrollo ──────────────────────────────
+  descuentos-anticipados-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: dev
+    container_name: descuentos_anticipados_dev
+    volumes:
+      - .:/app
+      - adk_state:/app/agents/descuentos_anticipados/.adk
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    restart: unless-stopped
+    command: >
+      sh -c "cd /app/agents && adk web . --host 0.0.0.0 --port 8000 --no_use_local_storage"
+
+  # ── API REST para integraciones (Zoho Desk, etc.) ───────────
+  descuentos-anticipados-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: descuentos_anticipados_api
+    volumes:
+      - .:/app
+      - adk_state:/app/agents/descuentos_anticipados/.adk
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    restart: unless-stopped
+    command: >
+      sh -c "cd /app/agents && adk api_server . --host 0.0.0.0 --port 8080 --no_use_local_storage"
+
+volumes:
+  adk_state:
