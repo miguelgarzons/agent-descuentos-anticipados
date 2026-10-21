@@ -6,6 +6,11 @@ import logging
 for _nombre in ("httpx", "httpcore"):
     logging.getLogger(_nombre).setLevel(logging.WARNING)
 
+from descuentos_anticipados.tools.zoho_actions import instalar_filtro_url_mcp  # noqa: E402
+
+# Y en los errores: un 4xx/5xx del MCP llega como excepción con la URL en el mensaje.
+instalar_filtro_url_mcp()
+
 from descuentos_anticipados.subagents import build_root_agent  # noqa: E402
 
 root_agent = build_root_agent()

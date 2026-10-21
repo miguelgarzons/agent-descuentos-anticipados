@@ -6,15 +6,11 @@ from typing import Any
 logger = logging.getLogger("adk.pipeline.descuentos_anticipados")
 
 
-def _extract_text_preview(user_content: Any) -> str:
-    if user_content is None:
-        return ""
-    parts = getattr(user_content, "parts", None)
-    if not parts:
-        return ""
-    texts = [p.text.strip() for p in parts if isinstance(getattr(p, "text", None), str) and p.text.strip()]
-    preview = " ".join(texts)
-    return f"{preview[:220]}..." if len(preview) > 220 else preview
+def _input_chars(user_content: Any) -> int:
+    """Largo del texto de entrada. Solo el largo: la entrada es el ticket de Zoho
+    (correo, cédula, nombre, descripción) y no debe llegar a Cloud Logging."""
+    parts = getattr(user_content, "parts", None) or []
+    return sum(len(p.text) for p in parts if isinstance(getattr(p, "text", None), str))
 
 
 def log_before_agent(callback_context: Any = None, **_: Any):
@@ -23,11 +19,11 @@ def log_before_agent(callback_context: Any = None, **_: Any):
         return None
     session_id = getattr(getattr(ctx, "session", None), "id", "")
     logger.info(
-        "PIPELINE_STEP_START agent=%s session_id=%s invocation_id=%s preview=%s",
+        "PIPELINE_STEP_START agent=%s session_id=%s invocation_id=%s input_chars=%d",
         getattr(ctx, "agent_name", ""),
         session_id,
         getattr(ctx, "invocation_id", ""),
-        _extract_text_preview(getattr(ctx, "user_content", None)),
+        _input_chars(getattr(ctx, "user_content", None)),
     )
     return None
 

@@ -220,10 +220,12 @@ class ReceptorAgent(BaseAgent):
             "periodo": periodo,
         }
 
+        # Del documento solo el largo: los primeros dígitos de una cédula corta
+        # son casi el número completo.
         logger.info(
-            "RECEPTOR_OK ticket_id=%s doc=%s... periodo=%s",
+            "RECEPTOR_OK ticket_id=%s doc_len=%d periodo=%s",
             ticket["id"],
-            ticket["numero_documento"][:6],
+            len(ticket["numero_documento"]),
             ticket["periodo"] or "-",
         )
         yield Event(

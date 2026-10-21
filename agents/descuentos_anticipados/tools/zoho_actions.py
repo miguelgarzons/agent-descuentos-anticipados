@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Any
 
 from mcp import ClientSession
@@ -81,12 +82,81 @@ def _result_to_dict(result: Any) -> dict:
     return parsed if isinstance(parsed, dict) else {"data": parsed}
 
 
+# La URL del MCP lleva el token en la ruta (https://<tenant>.zohomcp.com/mcp/<token>/message).
+_MCP_RUTA_RE = re.compile(r"/mcp/[^\s'\"<>]+")
+
+
+def redactar_url_mcp(texto: str) -> str:
+    """Quita de un texto la URL del MCP de Zoho, que lleva el token en la ruta.
+
+    Ante un 4xx/5xx del MCP, httpx arma el mensaje de la excepción con la URL
+    completa ("Client error '400 Bad Request' for url 'https://...'"), y ese
+    mensaje termina en el log y en el estado de la sesión.
+    """
+    url = _mcp_url()
+    if url:
+        texto = texto.replace(url, "<ZOHO_MCP_URL>")
+    return _MCP_RUTA_RE.sub("/mcp/<redactado>", texto)
+
+
+class FiltroUrlMcp(logging.Filter):
+    """Redacta la URL del MCP en el mensaje y el traceback de cada registro.
+
+    Un filtro de logger solo ve los registros creados en ESE logger, así que se
+    instala por nombre (ver `instalar_filtro_url_mcp`).
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        # Lo que lanza un filtro no lo atrapa logging: rompería la llamada de log
+        # de quien registra. Ante cualquier fallo, el registro sale tal cual.
+        try:
+            mensaje = record.getMessage()
+            limpio = redactar_url_mcp(mensaje)
+            if limpio != mensaje:
+                record.msg, record.args = limpio, None
+            # El Formatter estándar reutiliza exc_text: se arma aquí, redactado.
+            if record.exc_info and not record.exc_text:
+                record.exc_text = logging.Formatter().formatException(record.exc_info)
+            if record.exc_text:
+                traza = redactar_url_mcp(record.exc_text)
+                if traza != record.exc_text:
+                    record.exc_text = traza
+                    # Un formatter que rearme la traza desde exc_info la filtraría.
+                    record.exc_info = None
+        except Exception:  # noqa: BLE001
+            pass
+        return True
+
+
+# Loggers que pueden escribir la URL del MCP: el del pipeline, el transporte de
+# mcp (su post_writer hace logger.exception con el HTTPStatusError), la sesión
+# de mcp (se llama "client") y httpx/httpcore.
+_LOGGERS_CON_URL_MCP = (
+    "adk.pipeline.descuentos_anticipados",
+    "mcp.client.streamable_http",
+    "client",
+    "httpx",
+    "httpcore",
+)
+
+
+def instalar_filtro_url_mcp() -> None:
+    """Instala `FiltroUrlMcp` en los loggers que pueden registrar la URL (idempotente)."""
+    for nombre in _LOGGERS_CON_URL_MCP:
+        log = logging.getLogger(nombre)
+        if not any(isinstance(f, FiltroUrlMcp) for f in log.filters):
+            log.addFilter(FiltroUrlMcp())
+
+
 def _exc_detail(exc: BaseException) -> str:
-    """Extrae un mensaje legible, desenrollando ExceptionGroup de anyio/MCP."""
+    """Extrae un mensaje legible, desenrollando ExceptionGroup de anyio/MCP.
+
+    Sale redactado: el mensaje de un HTTPStatusError trae la URL del MCP.
+    """
     subs = getattr(exc, "exceptions", None)
     if subs:
         return " || ".join(_exc_detail(e) for e in subs)
-    return f"{type(exc).__name__}: {exc}"
+    return redactar_url_mcp(f"{type(exc).__name__}: {exc}")
 
 
 async def _call_zoho(tool_name: str, arguments: dict) -> dict:
@@ -117,7 +187,7 @@ async def _call_zoho(tool_name: str, arguments: dict) -> dict:
 
     data = _result_to_dict(result)
     if getattr(result, "isError", False):
-        logger.error("ZOHO_MCP_ERR tool=%s data=%s", tool_name, str(data)[:300])
+        logger.error("ZOHO_MCP_ERR tool=%s data=%s", tool_name, redactar_url_mcp(str(data))[:300])
         return {"error": f"MCP tool {tool_name} error", "detail": data}
     return data
 
