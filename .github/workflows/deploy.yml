@@ -584,6 +584,46 @@ jobs:
           fi
 
       # ──────────────────────────────────────────────────────
+      # CONFIGURACIÓN REQUERIDA — falla ANTES de construir la imagen
+      #
+      # El deploy pasa todas las variables aunque estén vacías, y vacía no es lo
+      # mismo que ausente: AGENT_MODEL="" deja al agente sin modelo, y sin
+      # ZOHO_MCP_URL / ZOHO_ORG_ID el emisor no puede comentar el ticket.
+      # ──────────────────────────────────────────────────────
+      - name: Validar configuración requerida
+        env:
+          EV_AGENT_MODEL: ${{ vars.AGENT_MODEL }}
+          EV_GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          EV_ZOHO_MCP_URL: ${{ secrets.ZOHO_MCP_URL }}
+          EV_ZOHO_ORG_ID: ${{ vars.ZOHO_ORG_ID }}
+        run: |
+          REQUERIDAS=(AGENT_MODEL GEMINI_API_KEY ZOHO_MCP_URL ZOHO_ORG_ID)
+          # Credenciales: Secrets del environment (enmascarados en el log). El resto:
+          # Variables.
+          SECRETOS=" GEMINI_API_KEY ZOHO_MCP_URL "
+          FALTAN=0
+          for NAME in "${REQUERIDAS[@]}"; do
+            VAL="$(printenv "EV_${NAME}" || true)"
+            TIPO=Variables
+            [[ "$SECRETOS" == *" ${NAME} "* ]] && TIPO=Secrets
+            if [ -z "$(printf '%s' "$VAL" | tr -d '[:space:]')" ]; then
+              echo "::error::Falta ${NAME}: defínela en Settings → Environments → ${{ github.ref_name == 'main' && 'main' || 'develop' }} → ${TIPO}."
+              FALTAN=1
+              continue
+            fi
+            # Copiadas de un .env, las comillas llegan a Cloud Run como parte del valor.
+            case "$VAL" in
+              \"*\"|\'*\')
+                echo "::error::${NAME} está entre comillas: quítalas en Settings → Environments → ${{ github.ref_name == 'main' && 'main' || 'develop' }} → ${TIPO}."
+                FALTAN=1 ;;
+            esac
+          done
+          if [ "$FALTAN" -eq 1 ]; then
+            exit 1
+          fi
+          echo "✅ Configuración requerida presente."
+
+      # ──────────────────────────────────────────────────────
       # GUARDA DE CONFIGURACIÓN DE PROD
       #
       # `--set-env-vars` reemplaza TODO el conjunto, así que el deploy sobrescribe
@@ -601,7 +641,7 @@ jobs:
         env:
           EV_ZOHO_ASSIGNEE_AGENT_ID: ${{ vars.ZOHO_ASSIGNEE_AGENT_ID }}
           EV_ZOHO_TOKEN_WEBHOOK_URL: ${{ vars.ZOHO_TOKEN_WEBHOOK_URL }}
-          EV_ZOHO_MCP_URL: ${{ vars.ZOHO_MCP_URL }}
+          EV_ZOHO_MCP_URL: ${{ secrets.ZOHO_MCP_URL }}
         run: |
           FALLOS=0
 
@@ -678,6 +718,9 @@ jobs:
         env:
           # ────────────────────────────────────────────────────────────────
           # Variables tomadas de Settings → Environments (main/develop) → Variables.
+          # Las credenciales (GEMINI_API_KEY, ZOHO_MCP_URL, ZOHO_TOKEN_WEBHOOK_USER,
+          # ZOHO_TOKEN_WEBHOOK_PASS) van en Secrets del environment: el log del job
+          # imprime el bloque env: y solo enmascara secrets.*, y este repo es público.
           # IMPORTANTE: se pasan por el bloque env: (no interpoladas en el script)
           # para que bash NO reinterprete su contenido — una contraseña con `$`
           # interpolada directo en el run: se expande como variable de shell y
@@ -686,12 +729,12 @@ jobs:
           # aquí como EV_MI_VAR y súmala al --set-env-vars con ${EV_MI_VAR}.
           # ────────────────────────────────────────────────────────────────
           EV_AGENT_MODEL: ${{ vars.AGENT_MODEL }}
-          EV_GEMINI_API_KEY: ${{ vars.GEMINI_API_KEY }}
-          EV_ZOHO_MCP_URL: ${{ vars.ZOHO_MCP_URL }}
+          EV_GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          EV_ZOHO_MCP_URL: ${{ secrets.ZOHO_MCP_URL }}
           EV_ZOHO_ORG_ID: ${{ vars.ZOHO_ORG_ID }}
           EV_ZOHO_TOKEN_WEBHOOK_URL: ${{ vars.ZOHO_TOKEN_WEBHOOK_URL }}
-          EV_ZOHO_TOKEN_WEBHOOK_USER: ${{ vars.ZOHO_TOKEN_WEBHOOK_USER }}
-          EV_ZOHO_TOKEN_WEBHOOK_PASS: ${{ vars.ZOHO_TOKEN_WEBHOOK_PASS }}
+          EV_ZOHO_TOKEN_WEBHOOK_USER: ${{ secrets.ZOHO_TOKEN_WEBHOOK_USER }}
+          EV_ZOHO_TOKEN_WEBHOOK_PASS: ${{ secrets.ZOHO_TOKEN_WEBHOOK_PASS }}
           EV_ZOHO_DESK_API_BASE_SANDBOX: ${{ vars.ZOHO_DESK_API_BASE_SANDBOX }}
           EV_ZOHO_ASSIGNEE_AGENT_ID: ${{ vars.ZOHO_ASSIGNEE_AGENT_ID }}
           EV_ASSETS_FAB: ${{ vars.ASSETS_FAB }}
@@ -713,23 +756,33 @@ jobs:
             --set-env-vars="^:@:^ENVIRONMENT=${ENVIRONMENT}:@:AGENT_MODEL=${EV_AGENT_MODEL}:@:GEMINI_API_KEY=${EV_GEMINI_API_KEY}:@:ZOHO_MCP_URL=${EV_ZOHO_MCP_URL}:@:ZOHO_ORG_ID=${EV_ZOHO_ORG_ID}:@:ZOHO_TOKEN_WEBHOOK_URL=${EV_ZOHO_TOKEN_WEBHOOK_URL}:@:ZOHO_TOKEN_WEBHOOK_USER=${EV_ZOHO_TOKEN_WEBHOOK_USER}:@:ZOHO_TOKEN_WEBHOOK_PASS=${EV_ZOHO_TOKEN_WEBHOOK_PASS}:@:ZOHO_DESK_API_BASE_SANDBOX=${EV_ZOHO_DESK_API_BASE_SANDBOX}:@:ZOHO_ASSIGNEE_AGENT_ID=${EV_ZOHO_ASSIGNEE_AGENT_ID}:@:ASSETS_FAB=${EV_ASSETS_FAB}:@:WATERMARK_PRYMARY_MAME=${EV_WATERMARK_PRYMARY_MAME}:@:WATERMARK_PRYMARY_AREA=${EV_WATERMARK_PRYMARY_AREA}:@:WATERMARK_PRYMARY_VICE=${EV_WATERMARK_PRYMARY_VICE}:@:WATERMARK_WEB=${EV_WATERMARK_WEB}:@:GOOGLE_CLOUD_PROJECT=${PROJECT_ID}:@:IDEMPOTENCY_ENABLED=true:@:IDEMPOTENCY_COLLECTION=descuentos_anticipados_idempotency:@:FIRESTORE_DATABASE=categorizador-${ENVIRONMENT}"
 
       # ──────────────────────────────────────────────────────
-      # NOTA: La tubería Pub/Sub (topic, suscripción, IAM, Firestore) se
-      # provisiona UNA VEZ, fuera del CI, con
-      # agent-categorizador/infra/setup_pubsub_handoff.sh. No se hace aquí
-      # para no requerir permisos admin en la SA del CI.
+      # NOTA: este agente NO está conectado al categorizador: no hay topic ni
+      # suscripción Pub/Sub que le entregue tickets. El endpoint
+      # /apps/descuentos_anticipados/trigger/pubsub queda disponible por si se
+      # conecta más adelante (con agent-categorizador/infra/setup_pubsub_handoff.sh).
       # ──────────────────────────────────────────────────────
 
       # ──────────────────────────────────────────────────────
       # VERIFY DEPLOYMENT
       # ──────────────────────────────────────────────────────
+      # ADK importa el agente de forma perezosa: no basta con que Cloud Run
+      # escuche el puerto. `/list-apps?detailed=true` lo carga y devuelve su
+      # rootAgentName; si un import falla, el deploy se cae aquí y no con el
+      # primer ticket real.
       - name: Verify deployment
         run: |
-          sleep 10
-
           URL=$(gcloud run services describe ${{ env.SERVICE_NAME }} \
             --platform managed \
             --region ${{ env.REGION }} \
             --format='value(status.url)')
+
+          APPS=$(curl --fail --silent --show-error --retry 5 --retry-delay 5 \
+            --retry-all-errors "$URL/list-apps?detailed=true")
+          echo "list-apps: $APPS"
+          echo "$APPS" | grep -Eq '"rootAgentName": ?"agente_descuentos_anticipados"' || {
+            echo "❌ El servicio respondió pero no cargó el agente descuentos_anticipados."
+            exit 1
+          }
 
           echo "======================================"
           echo "Deployment successful"

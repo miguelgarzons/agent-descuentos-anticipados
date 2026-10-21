@@ -1,6 +1,8 @@
 # agent-descuentos-anticipados
 
-Agente ADK de CUN para gestionar solicitudes de **descuentos anticipados** que llegan como tickets de Zoho Desk. Misma arquitectura que `agent-saldos-a-favor` y `agent-descuento-convenios`: pipeline secuencial disparado por Pub/Sub, desplegado en Cloud Run.
+Agente ADK de CUN para gestionar solicitudes de **descuentos anticipados** que llegan como tickets de Zoho Desk. Misma arquitectura que `agent-saldos-a-favor` y `agent-descuento-convenios`: pipeline secuencial desplegado en Cloud Run.
+
+> **No está conectado al categorizador.** No existe topic ni suscripción Pub/Sub que le entregue tickets. El endpoint `/apps/descuentos_anticipados/trigger/pubsub` queda disponible, y también `/run`, por si se conecta más adelante.
 
 > **Estado: cascarón.** El flujo de negocio todavía no está definido. Hoy el agente solo recibe el ticket, lo comenta (nota interna) y lo asigna a un asesor humano. Los subagentes de negocio se agregan entre receptor y emisor.
 
@@ -51,6 +53,17 @@ docker-compose up --build descuentos-anticipados-api    # adk api_server en :808
 
 ## Deploy
 
-`.github/workflows/deploy.yml`: `develop` → servicio `adk-descuentos-anticipados-dev`, `main` → `-prod`. Corre gates de seguridad (gitleaks, `.env`, pip-audit), tests con cobertura y `gcloud run deploy`. Las variables salen de *Settings → Environments → Variables* (ver `.env.example`).
+`.github/workflows/deploy.yml`: `develop` → servicio `adk-descuentos-anticipados-dev`, `main` → `-prod`. Corre gates de seguridad (gitleaks, `.env`, pip-audit), tests con cobertura, valida la configuración requerida, `gcloud run deploy` y comprueba con `/list-apps?detailed=true` que el agente carga.
 
-Antes del primer deploy falta, fuera de este repo: crear los repos de Artifact Registry (`adk-descuentos-anticipados-dev/prod`), el servicio, y la suscripción Pub/Sub que apunta a `/apps/descuentos_anticipados/trigger/pubsub`.
+La configuración sale del environment de GitHub (`develop` o `main`). Las credenciales (`GEMINI_API_KEY`, `ZOHO_MCP_URL`, `ZOHO_TOKEN_WEBHOOK_USER`, `ZOHO_TOKEN_WEBHOOK_PASS`) van como **Secrets**, porque el repo es público y el log del deploy imprime las Variables sin enmascarar. El resto va como Variables.
+
+Preparación, una sola vez (ver `infra/`):
+
+```bash
+gcloud auth login
+CREAR_LLAVE=1 bash infra/setup_service_account.sh     # SA descuentos-anticipados@ + 5 roles + AR dev + GCP_SA_KEY
+cp infra/variables.develop.example infra/variables.develop.env   # completar
+bash infra/cargar_variables_github.sh develop infra/variables.develop.env
+```
+
+Después, un push a `develop` despliega dev. Para prod: `ENTORNOS="dev prod" bash infra/setup_service_account.sh`, cargar el environment `main` con valores de prod y hacer push a `main`.

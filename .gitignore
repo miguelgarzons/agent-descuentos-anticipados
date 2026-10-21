@@ -36,6 +36,7 @@ wheels/
 .env.local
 .env.prod
 !.env.example
+infra/variables.*.env
 
 # OS
 .DS_Store

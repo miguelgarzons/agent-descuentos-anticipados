@@ -1,0 +1,40 @@
+# Plantilla de la configuración del environment `develop` de GitHub (Cloud Run dev).
+#
+# Copia este archivo a infra/variables.develop.env (ignorado por git), completa los
+# valores y cárgalos con:
+#   bash infra/cargar_variables_github.sh develop infra/variables.develop.env
+#
+# El script guarda como SECRETS del environment las marcadas [secret] y como
+# Variables el resto. Formato KEY=valor, sin comillas. Las líneas vacías no se
+# cargan. Obligatorias: el deploy falla antes de construir si falta alguna.
+
+# ── Modelo (obligatorias) ────────────────────────────────────────────────────────
+AGENT_MODEL=gemini-2.5-pro
+# [secret]
+GEMINI_API_KEY=
+
+# ── Zoho Desk vía MCP (obligatorias) ─────────────────────────────────────────────
+# [secret] URL del MCP del portal de DEV (lleva el token: no la pegues en tickets ni chats)
+ZOHO_MCP_URL=
+# Org del sandbox de Zoho (el de dev de todos los agentes)
+ZOHO_ORG_ID=929794023
+
+# ── Asignación al asesor humano ──────────────────────────────────────────────────
+# ID numérico del agente en el org de DEV, o su correo (se resuelve con getAgents).
+# Vacío: el ticket se comenta pero no se reasigna.
+ZOHO_ASSIGNEE_AGENT_ID=
+
+# ── Zoho Desk REST: adjuntos (opcional; el pipeline actual no los usa) ──────────
+ZOHO_TOKEN_WEBHOOK_URL=
+# [secret]
+ZOHO_TOKEN_WEBHOOK_USER=
+# [secret]
+ZOHO_TOKEN_WEBHOOK_PASS=
+ZOHO_DESK_API_BASE_SANDBOX=https://desk.zoho.com/api/v1
+
+# ── Pie institucional de los correos ─────────────────────────────────────────────
+ASSETS_FAB=https://assetsfab.cunapp.pro
+WATERMARK_PRYMARY_MAME=Descuentos anticipados
+WATERMARK_PRYMARY_AREA=Financiero
+WATERMARK_PRYMARY_VICE=Vicerrectoría de Servicios Digitales
+WATERMARK_WEB=www.cun.edu.co
